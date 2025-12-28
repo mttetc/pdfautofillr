@@ -5,7 +5,7 @@ import { Document, Page, pdfjs } from 'react-pdf';
 import { Spinner } from '@heroui/react';
 import { SignatureOverlay, type SignatureOverlayRef } from './signature-overlay';
 
-// Import required CSS for annotation layer (forms)
+// Import required CSS for annotation layer (forms) and text layer
 import 'react-pdf/dist/Page/AnnotationLayer.css';
 import 'react-pdf/dist/Page/TextLayer.css';
 
@@ -15,7 +15,8 @@ pdfjs.GlobalWorkerOptions.workerSrc = new URL(
     import.meta.url,
 ).toString();
 
-const PDF_WIDTH = 700;
+// A4 native width in PDF points (595.28, rounded)
+const PDF_WIDTH = 595;
 
 export interface PdfViewerRef {
     getFormValues: () => Record<string, string>;
@@ -46,17 +47,17 @@ const PdfViewerInner = forwardRef<PdfViewerRef, Props>(({
     const firstPageRef = useRef<HTMLDivElement>(null);
     const internalSignatureRef = useRef<SignatureOverlayRef>(null);
 
-    // Use external ref if provided, otherwise use internal
     const actualSignatureRef = signatureRef || internalSignatureRef;
 
-    // Expose methods to parent via ref
     useImperativeHandle(ref, () => ({
         getFormValues: () => ({ ...formValuesRef.current }),
         getFieldNames: () => [...fieldNames],
         getFirstPageDimensions: () => {
             if (firstPageRef.current) {
-                const rect = firstPageRef.current.getBoundingClientRect();
-                return { width: rect.width, height: rect.height };
+                const canvas = firstPageRef.current.querySelector('canvas');
+                if (canvas) {
+                    return { width: canvas.offsetWidth, height: canvas.offsetHeight };
+                }
             }
             return null;
         },
@@ -71,7 +72,6 @@ const PdfViewerInner = forwardRef<PdfViewerRef, Props>(({
     const handleLoadSuccess = useCallback(async ({ numPages }: { numPages: number }) => {
         setNumPages(numPages);
 
-        // Detect form fields
         try {
             const arrayBuffer = await file.arrayBuffer();
             const pdf = await pdfjs.getDocument({ data: arrayBuffer }).promise;
@@ -95,7 +95,6 @@ const PdfViewerInner = forwardRef<PdfViewerRef, Props>(({
         }
     }, [file, onFieldsDetected]);
 
-    // Set up event listeners to capture form input changes
     useEffect(() => {
         const container = containerRef.current;
         if (!container) return;
@@ -111,7 +110,6 @@ const PdfViewerInner = forwardRef<PdfViewerRef, Props>(({
             }
         };
 
-        // Listen for input events on the annotation layer
         container.addEventListener('input', handleInput, true);
         container.addEventListener('change', handleInput, true);
 
@@ -123,51 +121,23 @@ const PdfViewerInner = forwardRef<PdfViewerRef, Props>(({
 
     return (
         <div ref={containerRef} className="h-full overflow-auto">
-            {/* Custom CSS to fix annotation layer sizing */}
-            <style>{`
-                .react-pdf__Page {
-                    position: relative;
-                }
-                .react-pdf__Page__annotations {
-                    width: 100% !important;
-                    height: 100% !important;
-                    position: absolute !important;
-                    top: 0 !important;
-                    left: 0 !important;
-                }
-                .react-pdf__Page__textContent {
-                    top: 0 !important;
-                    left: 0 !important;
-                    transform: none !important;
-                    width: 100% !important;
-                    height: 100% !important;
-                }
-            `}</style>
-
             <Document
                 file={file}
                 onLoadSuccess={handleLoadSuccess}
                 loading={<Spinner size="lg" color="white" />}
                 error={<div className="text-danger p-4">Erreur de chargement du PDF</div>}
-                className="flex flex-col gap-4"
+                className="flex flex-col items-center"
             >
                 {Array.from({ length: numPages }, (_, index) => (
-                    <div
+                    <Page
                         key={index}
-                        ref={index === 0 ? firstPageRef : undefined}
-                        className="relative shadow-2xl shadow-black/50"
-                        style={{ width: PDF_WIDTH }}
+                        inputRef={index === 0 ? firstPageRef : null}
+                        pageNumber={index + 1}
+                        width={PDF_WIDTH}
+                        renderTextLayer={true}
+                        renderAnnotationLayer={true}
+                        renderForms={true}
                     >
-                        <Page
-                            pageNumber={index + 1}
-                            className="!bg-white"
-                            renderTextLayer={true}
-                            renderAnnotationLayer={true}
-                            renderForms={true}
-                            width={PDF_WIDTH}
-                            canvasBackground="white"
-                        />
-                        {/* Signature overlay only on first page */}
                         {index === 0 && signatureDataUrl && (
                             <SignatureOverlay
                                 ref={actualSignatureRef as React.RefObject<SignatureOverlayRef>}
@@ -176,7 +146,7 @@ const PdfViewerInner = forwardRef<PdfViewerRef, Props>(({
                                 containerRef={firstPageRef}
                             />
                         )}
-                    </div>
+                    </Page>
                 ))}
             </Document>
         </div>
@@ -186,3 +156,5 @@ const PdfViewerInner = forwardRef<PdfViewerRef, Props>(({
 PdfViewerInner.displayName = 'PdfViewerInner';
 
 export default PdfViewerInner;
+
+
