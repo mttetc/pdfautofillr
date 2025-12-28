@@ -1,9 +1,11 @@
 'use client';
 
 import { useState, useEffect, useRef, useImperativeHandle, forwardRef, useCallback } from 'react';
+import { useResizeObserver } from '@wojtekmaj/react-hooks';
 import { Document, Page, pdfjs } from 'react-pdf';
 import { Spinner } from '@heroui/react';
 import { SignatureOverlay, type SignatureOverlayRef } from './signature-overlay';
+import { PageThumbnails } from './page-thumbnails';
 
 // Import required CSS for annotation layer (forms) and text layer
 import 'react-pdf/dist/Page/AnnotationLayer.css';
@@ -15,14 +17,21 @@ pdfjs.GlobalWorkerOptions.workerSrc = new URL(
     import.meta.url,
 ).toString();
 
-// A4 native width in PDF points (595.28, rounded)
-const PDF_WIDTH = 595;
+// Options for Document component (fonts, cMaps, wasm)
+const options = {
+    cMapUrl: '/cmaps/',
+    standardFontDataUrl: '/standard_fonts/',
+};
+
+const resizeObserverOptions = {};
+const maxWidth = 800;
 
 export interface PdfViewerRef {
     getFormValues: () => Record<string, string>;
     getFieldNames: () => string[];
-    getFirstPageDimensions: () => { width: number; height: number } | null;
+    getSelectedPageDimensions: () => { width: number; height: number } | null;
     getSignaturePosition: () => { x: number; y: number; width: number; height: number } | null;
+    getSelectedPage: () => number;
 }
 
 interface Props {
@@ -41,20 +50,41 @@ const PdfViewerInner = forwardRef<PdfViewerRef, Props>(({
     onRemoveSignature
 }, ref) => {
     const [numPages, setNumPages] = useState(0);
+    const [selectedPage, setSelectedPage] = useState(0);
     const [fieldNames, setFieldNames] = useState<string[]>([]);
+    const [containerRef, setContainerRef] = useState<HTMLElement | null>(null);
+    const [containerWidth, setContainerWidth] = useState<number>();
     const formValuesRef = useRef<Record<string, string>>({});
-    const containerRef = useRef<HTMLDivElement>(null);
-    const firstPageRef = useRef<HTMLDivElement>(null);
+    const pageRefs = useRef<Map<number, HTMLDivElement>>(new Map());
     const internalSignatureRef = useRef<SignatureOverlayRef>(null);
 
+    const onResize = useCallback<ResizeObserverCallback>((entries) => {
+        const [entry] = entries;
+        if (entry) {
+            setContainerWidth(entry.contentRect.width);
+        }
+    }, []);
+
+    useResizeObserver(containerRef, resizeObserverOptions, onResize);
+
     const actualSignatureRef = signatureRef || internalSignatureRef;
+
+    // Set page ref for a specific page index
+    const setPageRef = useCallback((index: number, element: HTMLDivElement | null) => {
+        if (element) {
+            pageRefs.current.set(index, element);
+        } else {
+            pageRefs.current.delete(index);
+        }
+    }, []);
 
     useImperativeHandle(ref, () => ({
         getFormValues: () => ({ ...formValuesRef.current }),
         getFieldNames: () => [...fieldNames],
-        getFirstPageDimensions: () => {
-            if (firstPageRef.current) {
-                const canvas = firstPageRef.current.querySelector('canvas');
+        getSelectedPageDimensions: () => {
+            const pageElement = pageRefs.current.get(selectedPage);
+            if (pageElement) {
+                const canvas = pageElement.querySelector('canvas');
                 if (canvas) {
                     return { width: canvas.offsetWidth, height: canvas.offsetHeight };
                 }
@@ -67,7 +97,8 @@ const PdfViewerInner = forwardRef<PdfViewerRef, Props>(({
             }
             return null;
         },
-    }), [fieldNames, actualSignatureRef]);
+        getSelectedPage: () => selectedPage,
+    }), [fieldNames, actualSignatureRef, selectedPage]);
 
     const handleLoadSuccess = useCallback(async ({ numPages }: { numPages: number }) => {
         setNumPages(numPages);
@@ -96,7 +127,7 @@ const PdfViewerInner = forwardRef<PdfViewerRef, Props>(({
     }, [file, onFieldsDetected]);
 
     useEffect(() => {
-        const container = containerRef.current;
+        const container = containerRef;
         if (!container) return;
 
         const handleInput = (event: Event) => {
@@ -117,38 +148,123 @@ const PdfViewerInner = forwardRef<PdfViewerRef, Props>(({
             container.removeEventListener('input', handleInput, true);
             container.removeEventListener('change', handleInput, true);
         };
-    }, [numPages]);
+    }, [containerRef, numPages]);
+
+    // Track if we're programmatically scrolling (to avoid observer conflicts)
+    const isScrollingRef = useRef(false);
+
+    // IntersectionObserver to detect visible page during scroll
+    useEffect(() => {
+        if (!containerRef || numPages === 0) return;
+
+        const observer = new IntersectionObserver(
+            (entries) => {
+                // Skip if we're doing a programmatic scroll
+                if (isScrollingRef.current) return;
+
+                // Find the most visible page
+                let maxRatio = 0;
+                let mostVisiblePage = selectedPage;
+
+                entries.forEach((entry) => {
+                    if (entry.isIntersecting && entry.intersectionRatio > maxRatio) {
+                        const pageIndex = parseInt(entry.target.getAttribute('data-page-index') || '0', 10);
+                        maxRatio = entry.intersectionRatio;
+                        mostVisiblePage = pageIndex;
+                    }
+                });
+
+                if (maxRatio > 0 && mostVisiblePage !== selectedPage) {
+                    setSelectedPage(mostVisiblePage);
+                }
+            },
+            {
+                root: containerRef,
+                threshold: [0, 0.25, 0.5, 0.75, 1],
+            }
+        );
+
+        // Observe all page elements
+        pageRefs.current.forEach((element) => {
+            observer.observe(element);
+        });
+
+        return () => observer.disconnect();
+    }, [containerRef, numPages, selectedPage]);
+
+    // Handle page selection from thumbnails
+    const handleSelectPage = useCallback((pageIndex: number) => {
+        setSelectedPage(pageIndex);
+        // Mark that we're doing a programmatic scroll
+        isScrollingRef.current = true;
+        // Scroll to the selected page
+        const pageElement = pageRefs.current.get(pageIndex);
+        if (pageElement) {
+            pageElement.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            // Reset the flag after scroll completes
+            setTimeout(() => {
+                isScrollingRef.current = false;
+            }, 500);
+        } else {
+            isScrollingRef.current = false;
+        }
+    }, []);
 
     return (
-        <div ref={containerRef} className="h-full overflow-auto">
-            <Document
-                file={file}
-                onLoadSuccess={handleLoadSuccess}
-                loading={<Spinner size="lg" color="white" />}
-                error={<div className="text-danger p-4">Erreur de chargement du PDF</div>}
-                className="flex flex-col items-center"
-            >
-                {Array.from({ length: numPages }, (_, index) => (
-                    <Page
-                        key={index}
-                        inputRef={index === 0 ? firstPageRef : null}
-                        pageNumber={index + 1}
-                        width={PDF_WIDTH}
-                        renderTextLayer={true}
-                        renderAnnotationLayer={true}
-                        renderForms={true}
-                    >
-                        {index === 0 && signatureDataUrl && (
-                            <SignatureOverlay
-                                ref={actualSignatureRef as React.RefObject<SignatureOverlayRef>}
-                                imageUrl={signatureDataUrl}
-                                onRemove={onRemoveSignature || (() => { })}
-                                containerRef={firstPageRef}
-                            />
-                        )}
-                    </Page>
-                ))}
-            </Document>
+        <div className="flex h-full w-full gap-3">
+            {/* Thumbnails sidebar (LEFT) */}
+            {numPages > 0 && (
+                <div className="flex-shrink-0 w-[100px] h-full overflow-y-auto">
+                    <Document file={file} options={options}>
+                        <PageThumbnails
+                            numPages={numPages}
+                            selectedPage={selectedPage}
+                            onSelectPage={handleSelectPage}
+                            file={file}
+                        />
+                    </Document>
+                </div>
+            )}
+
+            {/* Main PDF viewer (RIGHT) */}
+            <div ref={setContainerRef} className="flex-1 h-full min-w-0 overflow-auto">
+                <Document
+                    file={file}
+                    onLoadSuccess={handleLoadSuccess}
+                    options={options}
+                    loading={<Spinner size="lg" color="white" />}
+                    error={<div className="text-danger p-4">Erreur de chargement du PDF</div>}
+                    className="flex flex-col items-center gap-3"
+                >
+                    {Array.from({ length: numPages }, (_, index) => (
+                        <div
+                            key={`page_wrapper_${index}`}
+                            ref={(el) => setPageRef(index, el)}
+                            data-page-index={index}
+                            className={`relative ${selectedPage === index ? 'ring-2 ring-primary ring-offset-2 ring-offset-background rounded' : ''}`}
+                        >
+                            <Page
+                                pageNumber={index + 1}
+                                width={containerWidth ? Math.min(containerWidth - 20, maxWidth) : maxWidth}
+                                renderForms
+                                renderAnnotationLayer
+                                renderTextLayer
+                                onClick={() => setSelectedPage(index)}
+                            >
+                                {/* Signature overlay only on selected page */}
+                                {index === selectedPage && signatureDataUrl && (
+                                    <SignatureOverlay
+                                        ref={actualSignatureRef as React.RefObject<SignatureOverlayRef>}
+                                        imageUrl={signatureDataUrl}
+                                        onRemove={onRemoveSignature || (() => { })}
+                                        containerRef={{ current: pageRefs.current.get(selectedPage) || null }}
+                                    />
+                                )}
+                            </Page>
+                        </div>
+                    ))}
+                </Document>
+            </div>
         </div>
     );
 });
@@ -156,5 +272,3 @@ const PdfViewerInner = forwardRef<PdfViewerRef, Props>(({
 PdfViewerInner.displayName = 'PdfViewerInner';
 
 export default PdfViewerInner;
-
-

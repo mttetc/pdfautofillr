@@ -1,52 +1,47 @@
 'use client';
 
-import { useEffect, useState, useRef, useCallback } from 'react';
+import { useState, useRef, useCallback } from 'react';
+import dynamic from 'next/dynamic';
 import { Spinner } from '@heroui/react';
 import type { PdfViewerRef } from './pdf-viewer-inner';
 import type { SignatureOverlayRef } from './signature-overlay';
 import { exportFilledPdf, downloadPdf, type SignatureData } from '@/lib/pdf-utils';
 import type { DetectedField } from '@/types';
 
+// Dynamic imports for SSR-incompatible components
+const PdfViewerInner = dynamic(() => import('./pdf-viewer-inner'), {
+    ssr: false,
+    loading: () => (
+        <div className="flex items-center justify-center h-full">
+            <Spinner size="lg" color="white" />
+        </div>
+    ),
+});
+
+const PdfEditorSidebar = dynamic(() => import('./pdf-editor-sidebar'), {
+    ssr: false,
+});
+
+const ContextModal = dynamic(
+    () => import('./context-modal').then(mod => ({ default: mod.ContextModal })),
+    { ssr: false }
+);
+
+const SignatureModal = dynamic(
+    () => import('./signature-modal').then(mod => ({ default: mod.SignatureModal })),
+    { ssr: false }
+);
+
+const CreditAlert = dynamic(
+    () => import('./credit-alert').then(mod => ({ default: mod.CreditAlert })),
+    { ssr: false }
+);
+
 interface Props {
     file: File;
 }
 
 export default function PdfViewer({ file }: Props) {
-    const [PdfViewerInner, setPdfViewerInner] = useState<React.ComponentType<{
-        file: File;
-        ref: React.Ref<PdfViewerRef>;
-        onFieldsDetected?: (count: number) => void;
-        autoFillValues?: Record<string, string>;
-        signatureDataUrl?: string | null;
-        signatureRef?: React.RefObject<SignatureOverlayRef | null>;
-        onRemoveSignature?: () => void;
-    }> | null>(null);
-    const [PdfEditorSidebar, setPdfEditorSidebar] = useState<React.ComponentType<{
-        fileName: string;
-        fieldCount: number;
-        onExport: () => void;
-        onMagicFill: () => void;
-        onSignature: () => void;
-        isExporting?: boolean;
-        isAnalyzing?: boolean;
-    }> | null>(null);
-    const [ContextModal, setContextModal] = useState<React.ComponentType<{
-        isOpen: boolean;
-        onClose: () => void;
-        onConfirm: (context: string) => void;
-        detectedContext: string | null;
-        isLoading: boolean;
-    }> | null>(null);
-    const [SignatureModal, setSignatureModal] = useState<React.ComponentType<{
-        isOpen: boolean;
-        onClose: () => void;
-        onConfirm: (signatureDataUrl: string) => void;
-    }> | null>(null);
-    const [CreditAlert, setCreditAlert] = useState<React.ComponentType<{
-        isVisible: boolean;
-        message?: string;
-    }> | null>(null);
-
     const [fieldCount, setFieldCount] = useState(0);
     const [isExporting, setIsExporting] = useState(false);
     const [isAnalyzing, setIsAnalyzing] = useState(false);
@@ -54,29 +49,9 @@ export default function PdfViewer({ file }: Props) {
     const [isSignatureModalOpen, setIsSignatureModalOpen] = useState(false);
     const [detectedContext, setDetectedContext] = useState<string | null>(null);
     const [showCreditAlert, setShowCreditAlert] = useState(false);
-    const [autoFillValues, setAutoFillValues] = useState<Record<string, string>>({});
     const [signatureDataUrl, setSignatureDataUrl] = useState<string | null>(null);
     const viewerRef = useRef<PdfViewerRef>(null);
     const signatureRef = useRef<SignatureOverlayRef | null>(null);
-
-    useEffect(() => {
-        // Dynamically import components only on client side
-        const loadComponents = async () => {
-            const [viewerMod, sidebarMod, contextMod, signatureMod, alertMod] = await Promise.all([
-                import('./pdf-viewer-inner'),
-                import('./pdf-editor-sidebar'),
-                import('./context-modal'),
-                import('./signature-modal'),
-                import('./credit-alert'),
-            ]);
-            setPdfViewerInner(() => viewerMod.default);
-            setPdfEditorSidebar(() => sidebarMod.default);
-            setContextModal(() => contextMod.ContextModal);
-            setSignatureModal(() => signatureMod.SignatureModal);
-            setCreditAlert(() => alertMod.CreditAlert);
-        };
-        loadComponents();
-    }, []);
 
     const handleExport = useCallback(async () => {
         if (!viewerRef.current) return;
@@ -88,8 +63,9 @@ export default function PdfViewer({ file }: Props) {
 
             // Get signature data if present
             let signatureData: SignatureData | undefined;
-            const dims = viewerRef.current.getFirstPageDimensions();
+            const dims = viewerRef.current.getSelectedPageDimensions();
             const sigPos = viewerRef.current.getSignaturePosition();
+            const selectedPage = viewerRef.current.getSelectedPage();
 
             if (signatureDataUrl && dims && sigPos) {
                 signatureData = {
@@ -100,7 +76,7 @@ export default function PdfViewer({ file }: Props) {
                     height: sigPos.height,
                     containerWidth: dims.width,
                     containerHeight: dims.height,
-                    pageIndex: 0,
+                    pageIndex: selectedPage,
                 };
             }
 
@@ -170,7 +146,6 @@ export default function PdfViewer({ file }: Props) {
                 }
             });
 
-            setAutoFillValues(values);
             fillFormFields(values);
 
         } catch (err) {
@@ -201,48 +176,33 @@ export default function PdfViewer({ file }: Props) {
         });
     };
 
-    if (!PdfViewerInner || !PdfEditorSidebar) {
-        return (
-            <div className="flex items-center justify-center h-full">
-                <Spinner size="lg" color="white" />
-            </div>
-        );
-    }
-
     return (
         <div className="flex gap-4 h-full">
             {/* Credit Alert */}
-            {CreditAlert && (
-                <CreditAlert isVisible={showCreditAlert} />
-            )}
+            <CreditAlert isVisible={showCreditAlert} />
 
             {/* Context Modal */}
-            {ContextModal && (
-                <ContextModal
-                    isOpen={isContextModalOpen}
-                    onClose={() => setIsContextModalOpen(false)}
-                    onConfirm={handleAnalyze}
-                    detectedContext={detectedContext}
-                    isLoading={isAnalyzing}
-                />
-            )}
+            <ContextModal
+                isOpen={isContextModalOpen}
+                onClose={() => setIsContextModalOpen(false)}
+                onConfirm={handleAnalyze}
+                detectedContext={detectedContext}
+                isLoading={isAnalyzing}
+            />
 
             {/* Signature Modal */}
-            {SignatureModal && (
-                <SignatureModal
-                    isOpen={isSignatureModalOpen}
-                    onClose={() => setIsSignatureModalOpen(false)}
-                    onConfirm={handleSignatureConfirm}
-                />
-            )}
+            <SignatureModal
+                isOpen={isSignatureModalOpen}
+                onClose={() => setIsSignatureModalOpen(false)}
+                onConfirm={handleSignatureConfirm}
+            />
 
             {/* PDF Viewer (LEFT) */}
-            <div className="flex-1 h-full">
+            <div className="flex-1 h-full min-w-0">
                 <PdfViewerInner
                     file={file}
                     ref={viewerRef}
                     onFieldsDetected={setFieldCount}
-                    autoFillValues={autoFillValues}
                     signatureDataUrl={signatureDataUrl}
                     signatureRef={signatureRef}
                     onRemoveSignature={handleRemoveSignature}
@@ -262,3 +222,4 @@ export default function PdfViewer({ file }: Props) {
         </div>
     );
 }
+

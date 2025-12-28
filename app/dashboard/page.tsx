@@ -14,7 +14,7 @@ export default function DashboardPage() {
 
     if (file) {
         return (
-            <div className="h-[calc(100vh-4rem)] w-full p-4">
+            <div className="h-full w-full">
                 <PdfViewer file={file} />
             </div>
         );
