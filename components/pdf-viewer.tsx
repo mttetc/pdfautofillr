@@ -1,0 +1,264 @@
+'use client';
+
+import { useEffect, useState, useRef, useCallback } from 'react';
+import { Spinner } from '@heroui/react';
+import type { PdfViewerRef } from './pdf-viewer-inner';
+import type { SignatureOverlayRef } from './signature-overlay';
+import { exportFilledPdf, downloadPdf, type SignatureData } from '@/lib/pdf-utils';
+import type { DetectedField } from '@/types';
+
+interface Props {
+    file: File;
+}
+
+export default function PdfViewer({ file }: Props) {
+    const [PdfViewerInner, setPdfViewerInner] = useState<React.ComponentType<{
+        file: File;
+        ref: React.Ref<PdfViewerRef>;
+        onFieldsDetected?: (count: number) => void;
+        autoFillValues?: Record<string, string>;
+        signatureDataUrl?: string | null;
+        signatureRef?: React.RefObject<SignatureOverlayRef | null>;
+        onRemoveSignature?: () => void;
+    }> | null>(null);
+    const [PdfEditorSidebar, setPdfEditorSidebar] = useState<React.ComponentType<{
+        fileName: string;
+        fieldCount: number;
+        onExport: () => void;
+        onMagicFill: () => void;
+        onSignature: () => void;
+        isExporting?: boolean;
+        isAnalyzing?: boolean;
+    }> | null>(null);
+    const [ContextModal, setContextModal] = useState<React.ComponentType<{
+        isOpen: boolean;
+        onClose: () => void;
+        onConfirm: (context: string) => void;
+        detectedContext: string | null;
+        isLoading: boolean;
+    }> | null>(null);
+    const [SignatureModal, setSignatureModal] = useState<React.ComponentType<{
+        isOpen: boolean;
+        onClose: () => void;
+        onConfirm: (signatureDataUrl: string) => void;
+    }> | null>(null);
+    const [CreditAlert, setCreditAlert] = useState<React.ComponentType<{
+        isVisible: boolean;
+        message?: string;
+    }> | null>(null);
+
+    const [fieldCount, setFieldCount] = useState(0);
+    const [isExporting, setIsExporting] = useState(false);
+    const [isAnalyzing, setIsAnalyzing] = useState(false);
+    const [isContextModalOpen, setIsContextModalOpen] = useState(false);
+    const [isSignatureModalOpen, setIsSignatureModalOpen] = useState(false);
+    const [detectedContext, setDetectedContext] = useState<string | null>(null);
+    const [showCreditAlert, setShowCreditAlert] = useState(false);
+    const [autoFillValues, setAutoFillValues] = useState<Record<string, string>>({});
+    const [signatureDataUrl, setSignatureDataUrl] = useState<string | null>(null);
+    const viewerRef = useRef<PdfViewerRef>(null);
+    const signatureRef = useRef<SignatureOverlayRef | null>(null);
+
+    useEffect(() => {
+        // Dynamically import components only on client side
+        const loadComponents = async () => {
+            const [viewerMod, sidebarMod, contextMod, signatureMod, alertMod] = await Promise.all([
+                import('./pdf-viewer-inner'),
+                import('./pdf-editor-sidebar'),
+                import('./context-modal'),
+                import('./signature-modal'),
+                import('./credit-alert'),
+            ]);
+            setPdfViewerInner(() => viewerMod.default);
+            setPdfEditorSidebar(() => sidebarMod.default);
+            setContextModal(() => contextMod.ContextModal);
+            setSignatureModal(() => signatureMod.SignatureModal);
+            setCreditAlert(() => alertMod.CreditAlert);
+        };
+        loadComponents();
+    }, []);
+
+    const handleExport = useCallback(async () => {
+        if (!viewerRef.current) return;
+
+        setIsExporting(true);
+        try {
+            const formValues = viewerRef.current.getFormValues();
+            const originalBytes = await file.arrayBuffer();
+
+            // Get signature data if present
+            let signatureData: SignatureData | undefined;
+            const dims = viewerRef.current.getFirstPageDimensions();
+            const sigPos = viewerRef.current.getSignaturePosition();
+
+            if (signatureDataUrl && dims && sigPos) {
+                signatureData = {
+                    dataUrl: signatureDataUrl,
+                    x: sigPos.x,
+                    y: sigPos.y,
+                    width: sigPos.width,
+                    height: sigPos.height,
+                    containerWidth: dims.width,
+                    containerHeight: dims.height,
+                    pageIndex: 0,
+                };
+            }
+
+            const filledPdfBytes = await exportFilledPdf(originalBytes, formValues, signatureData);
+
+            const baseName = file.name.replace(/\.pdf$/i, '');
+            const exportName = `${baseName}_rempli.pdf`;
+
+            downloadPdf(filledPdfBytes, exportName);
+        } catch (err) {
+            console.error('Erreur export PDF:', err);
+        } finally {
+            setIsExporting(false);
+        }
+    }, [file, signatureDataUrl]);
+
+    const handleMagicFill = useCallback(() => {
+        setIsContextModalOpen(true);
+    }, []);
+
+    const handleSignature = useCallback(() => {
+        setIsSignatureModalOpen(true);
+    }, []);
+
+    const handleSignatureConfirm = useCallback((dataUrl: string) => {
+        setSignatureDataUrl(dataUrl);
+        setIsSignatureModalOpen(false);
+    }, []);
+
+    const handleRemoveSignature = useCallback(() => {
+        setSignatureDataUrl(null);
+    }, []);
+
+    const handleAnalyze = useCallback(async (context: string) => {
+        setIsAnalyzing(true);
+        setIsContextModalOpen(false);
+
+        try {
+            const formData = new FormData();
+            formData.append('file', file);
+            formData.append('context', context);
+
+            const response = await fetch('/api/analyze', {
+                method: 'POST',
+                body: formData,
+            });
+
+            const data = await response.json();
+
+            if (!response.ok) {
+                if (data.error === 'CREDIT_EXHAUSTED') {
+                    setShowCreditAlert(true);
+                    setTimeout(() => setShowCreditAlert(false), 5000);
+                    return;
+                }
+                throw new Error(data.error || 'Erreur analyse');
+            }
+
+            if (data.context) {
+                setDetectedContext(data.context);
+            }
+
+            const values: Record<string, string> = {};
+            (data.fields as DetectedField[]).forEach(field => {
+                if (field.suggestedValue && field.name) {
+                    values[field.name] = field.suggestedValue;
+                }
+            });
+
+            setAutoFillValues(values);
+            fillFormFields(values);
+
+        } catch (err) {
+            console.error('Erreur analyse:', err);
+        } finally {
+            setIsAnalyzing(false);
+        }
+    }, [file]);
+
+    const fillFormFields = (values: Record<string, string>) => {
+        Object.entries(values).forEach(([name, value]) => {
+            const elements = document.querySelectorAll(`[name="${name}"]`);
+            elements.forEach(el => {
+                if (el instanceof HTMLInputElement) {
+                    if (el.type === 'checkbox') {
+                        el.checked = value === 'true' || value === 'on';
+                    } else {
+                        el.value = value;
+                    }
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                } else if (el instanceof HTMLSelectElement || el instanceof HTMLTextAreaElement) {
+                    el.value = value;
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                }
+            });
+        });
+    };
+
+    if (!PdfViewerInner || !PdfEditorSidebar) {
+        return (
+            <div className="flex items-center justify-center h-full">
+                <Spinner size="lg" color="white" />
+            </div>
+        );
+    }
+
+    return (
+        <div className="flex gap-4 h-full">
+            {/* Credit Alert */}
+            {CreditAlert && (
+                <CreditAlert isVisible={showCreditAlert} />
+            )}
+
+            {/* Context Modal */}
+            {ContextModal && (
+                <ContextModal
+                    isOpen={isContextModalOpen}
+                    onClose={() => setIsContextModalOpen(false)}
+                    onConfirm={handleAnalyze}
+                    detectedContext={detectedContext}
+                    isLoading={isAnalyzing}
+                />
+            )}
+
+            {/* Signature Modal */}
+            {SignatureModal && (
+                <SignatureModal
+                    isOpen={isSignatureModalOpen}
+                    onClose={() => setIsSignatureModalOpen(false)}
+                    onConfirm={handleSignatureConfirm}
+                />
+            )}
+
+            {/* PDF Viewer (LEFT) */}
+            <div className="flex-1 h-full">
+                <PdfViewerInner
+                    file={file}
+                    ref={viewerRef}
+                    onFieldsDetected={setFieldCount}
+                    autoFillValues={autoFillValues}
+                    signatureDataUrl={signatureDataUrl}
+                    signatureRef={signatureRef}
+                    onRemoveSignature={handleRemoveSignature}
+                />
+            </div>
+
+            {/* Sidebar (RIGHT) */}
+            <PdfEditorSidebar
+                fileName={file.name}
+                fieldCount={fieldCount}
+                onExport={handleExport}
+                onMagicFill={handleMagicFill}
+                onSignature={handleSignature}
+                isExporting={isExporting}
+                isAnalyzing={isAnalyzing}
+            />
+        </div>
+    );
+}
