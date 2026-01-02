@@ -26,9 +26,16 @@ const options = {
 const resizeObserverOptions = {};
 const maxWidth = 800;
 
+export interface PdfFieldInfo {
+    name: string;
+    type: string;
+    alternativeText?: string;
+}
+
 export interface PdfViewerRef {
     getFormValues: () => Record<string, string>;
     getFieldNames: () => string[];
+    getFieldsInfo: () => PdfFieldInfo[];
     getSelectedPageDimensions: () => { width: number; height: number } | null;
     getSignaturePosition: () => { x: number; y: number; width: number; height: number } | null;
     getSelectedPage: () => number;
@@ -51,7 +58,7 @@ const PdfViewerInner = forwardRef<PdfViewerRef, Props>(({
 }, ref) => {
     const [numPages, setNumPages] = useState(0);
     const [selectedPage, setSelectedPage] = useState(0);
-    const [fieldNames, setFieldNames] = useState<string[]>([]);
+    const [fieldsInfo, setFieldsInfo] = useState<PdfFieldInfo[]>([]);
     const [containerRef, setContainerRef] = useState<HTMLElement | null>(null);
     const [containerWidth, setContainerWidth] = useState<number>();
     const formValuesRef = useRef<Record<string, string>>({});
@@ -80,7 +87,8 @@ const PdfViewerInner = forwardRef<PdfViewerRef, Props>(({
 
     useImperativeHandle(ref, () => ({
         getFormValues: () => ({ ...formValuesRef.current }),
-        getFieldNames: () => [...fieldNames],
+        getFieldNames: () => fieldsInfo.map(f => f.name),
+        getFieldsInfo: () => [...fieldsInfo],
         getSelectedPageDimensions: () => {
             const pageElement = pageRefs.current.get(selectedPage);
             if (pageElement) {
@@ -98,7 +106,7 @@ const PdfViewerInner = forwardRef<PdfViewerRef, Props>(({
             return null;
         },
         getSelectedPage: () => selectedPage,
-    }), [fieldNames, actualSignatureRef, selectedPage]);
+    }), [fieldsInfo, actualSignatureRef, selectedPage]);
 
     const handleLoadSuccess = useCallback(async ({ numPages }: { numPages: number }) => {
         setNumPages(numPages);
@@ -106,21 +114,87 @@ const PdfViewerInner = forwardRef<PdfViewerRef, Props>(({
         try {
             const arrayBuffer = await file.arrayBuffer();
             const pdf = await pdfjs.getDocument({ data: arrayBuffer }).promise;
-            const names: string[] = [];
+            const fields: PdfFieldInfo[] = [];
+            const seenNames = new Set<string>();
 
             for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
                 const page = await pdf.getPage(pageNum);
                 const annotations = await page.getAnnotations();
 
+                console.log('Annotations:', annotations);
+                // Get text content with positions
+                const textContent = await page.getTextContent();
+                const textItems: { text: string; x: number; y: number }[] = [];
+
+                for (const item of textContent.items) {
+                    // TextItem has 'str' and 'transform', TextMarkedContent doesn't
+                    if ('str' in item && 'transform' in item) {
+                        const textItem = item as { str: string; transform: number[] };
+                        if (textItem.str.trim().length > 0) {
+                            textItems.push({
+                                text: textItem.str.trim(),
+                                x: textItem.transform[4],
+                                y: textItem.transform[5],
+                            });
+                        }
+                    }
+                }
+
                 for (const annotation of annotations) {
                     if (annotation.subtype === 'Widget' && annotation.fieldName) {
-                        names.push(annotation.fieldName);
+                        // Skip duplicates
+                        if (seenNames.has(annotation.fieldName)) continue;
+                        seenNames.add(annotation.fieldName);
+
+                        // Get field position from rect [x1, y1, x2, y2]
+                        const rect = annotation.rect;
+                        const fieldX = rect[0];
+                        const fieldY = rect[1];
+
+                        // Find nearest MEANINGFUL text label (filter out dots and short text)
+                        let nearestLabel = '';
+                        let minDistance = Infinity;
+
+                        for (const textItem of textItems) {
+                            // Skip dotted lines, colons, and very short text
+                            const text = textItem.text;
+                            if (/^[.\s:]+$/.test(text)) continue; // Only dots, spaces, colons
+                            if (/^\.{3,}/.test(text)) continue; // Starts with multiple dots
+                            if (text.length < 3) continue; // Too short
+                            if (['jour', 'mois', 'année', 'an'].includes(text.toLowerCase())) continue; // Date labels
+
+                            // Text should be to the left or above the field
+                            const dx = fieldX - textItem.x;
+                            const dy = fieldY - textItem.y;
+
+                            // Only consider text that is to the left (dx > 0) or above (dy < 50 and dy > -20)
+                            if (dx > -10 && dx < 400 && dy > -30 && dy < 50) {
+                                const distance = Math.sqrt(dx * dx + dy * dy);
+                                if (distance < minDistance) {
+                                    minDistance = distance;
+                                    nearestLabel = text;
+                                }
+                            }
+                        }
+
+                        // Determine field type
+                        let fieldType = 'text';
+                        if (annotation.checkBox) fieldType = 'checkbox';
+                        else if (annotation.radioButton) fieldType = 'radio';
+                        else if (annotation.comboBox) fieldType = 'select';
+
+                        fields.push({
+                            name: annotation.fieldName,
+                            type: fieldType,
+                            alternativeText: nearestLabel || annotation.alternativeText || undefined,
+                        });
                     }
                 }
             }
 
-            setFieldNames(names);
-            onFieldsDetected?.(names.length);
+            console.log('📋 Extracted PDF fields with labels:', fields);
+            setFieldsInfo(fields);
+            onFieldsDetected?.(fields.length);
         } catch (err) {
             console.error('Erreur détection champs:', err);
         }

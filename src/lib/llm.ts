@@ -4,6 +4,13 @@
 import OpenAI from 'openai';
 import type { DetectedField } from '@/types';
 
+// Type for PDF field info from client
+export interface PdfFieldInfo {
+    name: string;
+    type: string;
+    alternativeText?: string;
+}
+
 let openaiClient: OpenAI | null = null;
 
 function getClient(): OpenAI {
@@ -73,39 +80,87 @@ Si incertain, réponds "UNKNOWN".`,
     }
 }
 
-const today = () => new Date().toLocaleDateString('fr-FR');
+function buildSystemPrompt(userContext: string, fieldsInfo: PdfFieldInfo[], pdfText: string): string {
+    // Detect form language/country from PDF text
+    const isFrench = /déclaration|formulaire|compte|étranger|impôts|cerfa/i.test(pdfText);
+    const formCountry = isFrench ? 'French/European' : 'Unknown';
 
-function buildSystemPrompt(userContext: string): string {
-    return `Tu analyses des formulaires PDF et retournes un JSON avec les champs à remplir.
+    // Filter to only fields with meaningful labels (not garbled text)
+    const meaningfulFields = fieldsInfo.filter(f => {
+        if (!f.alternativeText) return false;
+        // Skip garbled text (contains control characters)
+        if (/[\x00-\x1F]/.test(f.alternativeText)) return false;
+        // Skip very short or generic labels
+        if (f.alternativeText.length < 5) return false;
+        return true;
+    });
 
-CONTEXTE UTILISATEUR: ${userContext}
+    // Categorize fields - only institution/account related
+    const institutionFields = meaningfulFields.filter(f => {
+        const label = f.alternativeText?.toLowerCase() || '';
+        return label.includes('organisme') ||
+            label.includes('établissement') ||
+            label.includes('psan') ||
+            label.includes('gestionnaire') ||
+            label.includes('désignation') ||
+            label.includes('raison sociale') ||
+            label.includes('url') ||
+            label.includes('actifs numériques') ||
+            label.includes('compte bancaire') ||
+            label.includes('caractéristiques') ||
+            (label.includes('adresse') && (label.includes('organisme') || label.includes('gestionnaire')));
+    });
 
-RÈGLES pour "value":
-1. SI l'utilisateur a fourni des infos personnelles dans le contexte (nom, prénom, âge, adresse, email, etc.), UTILISE-LES pour remplir les champs correspondants
-2. Si aucune info perso fournie → null pour: nom, prénom, adresse, email, téléphone, IBAN, n° sécu, signature, montants
-3. Toujours suggérer: dates (${today()}), cases à cocher (false par défaut), pays ("France" si contexte FR)
+    const fieldsList = institutionFields.map(f => {
+        const type = f.type === 'checkbox' ? '[CHECKBOX]' : '[TEXT]';
+        return `- ${f.name} ${type}: "${f.alternativeText}"`;
+    }).join('\n');
 
-EXEMPLES d'extraction du contexte:
-- "je m'appelle Jean Dupont" → champ nom: "Jean Dupont"  
-- "j'ai 35 ans" → champ âge: "35"
-- "j'habite 12 rue de Paris" → champ adresse: "12 rue de Paris"
+    return `You are an expert at filling administrative forms.
 
-FORMAT JSON requis:
-{"fields": [{"id": "slug", "label": "Nom affiché", "type": "text|date|checkbox", "value": null|"valeur", "confidence": 0.9}]}`;
+FORM ORIGIN: ${formCountry}
+USER CONTEXT: "${userContext}"
+
+YOUR TASK:
+1. Identify the company/service mentioned in the context (e.g., "Coinbase", "Binance", "Revolut")
+2. Use YOUR KNOWLEDGE to find the correct legal entity for this form's country:
+   - For French/European forms → use the EUROPEAN subsidiary of the company
+   - Find the official company name, headquarters address, and country
+3. Fill ONLY fields related to the INSTITUTION/ORGANIZATION (not personal info)
+
+AVAILABLE FIELDS (institution-related only):
+${fieldsList}
+
+DO NOT FILL:
+- Personal fields (declarant's name, address, email)
+- Account numbers, amounts, dates
+- Tax IDs like SIRET (those are for the declarant, not the institution)
+
+FILL WITH YOUR KNOWLEDGE:
+- Organization name → official legal name of the European entity
+- Organization address → European headquarters address
+- URL if requested
+- Checkboxes matching the account type (crypto = "actifs numériques" = true)
+
+RESPOND IN JSON ONLY:
+{"fields": [{"name": "FIELD_NAME", "value": "VALUE"}]}`;
 }
 
 export async function analyzeFormWithLLM(
     pdfText: string,
-    context: string = ''
+    context: string = '',
+    fieldsInfo: PdfFieldInfo[] = []
 ): Promise<DetectedField[]> {
     try {
+        console.log('📋 PDF fields info:', fieldsInfo.slice(0, 10), '... (total:', fieldsInfo.length, ')');
+
         const response = await getClient().chat.completions.create({
             model: MODEL,
             messages: [
-                { role: 'system', content: buildSystemPrompt(context) },
+                { role: 'system', content: buildSystemPrompt(context, fieldsInfo, pdfText) },
                 {
                     role: 'user',
-                    content: `Analyse ce formulaire:\n\n${pdfText.slice(0, 6000)}`,
+                    content: `Voici le texte du formulaire. Analyse-le et remplis les champs appropriés:\n\n${pdfText.slice(0, 8000)}`,
                 },
             ],
             temperature: 0,
@@ -113,17 +168,26 @@ export async function analyzeFormWithLLM(
         });
 
         const content = response.choices[0]?.message?.content;
+        console.log('📝 LLM raw response:', content);
         if (!content) throw new Error('Réponse vide');
 
         const parsed = JSON.parse(content);
-        return (parsed.fields || []).map((f: Record<string, unknown>) => ({
-            id: String(f.id || ''),
-            name: String(f.id || f.name || ''),
-            label: String(f.label || ''),
-            type: String(f.type || 'text'),
-            suggestedValue: f.value ? String(f.value) : null,
-            confidence: Number(f.confidence || 0.5),
-        }));
+        const fields = parsed.fields || [];
+        console.log('✅ Fields to fill:', fields.length);
+
+        // Map to DetectedField format
+        return fields.map((f: Record<string, unknown>) => {
+            const fieldName = String(f.name || f.id || '');
+            const fieldInfo = fieldsInfo.find(fi => fi.name === fieldName);
+            return {
+                id: fieldName,
+                name: fieldName,
+                label: fieldName,
+                type: fieldInfo?.type || 'text',
+                suggestedValue: f.value !== null && f.value !== undefined ? String(f.value) : null,
+                confidence: 0.9,
+            };
+        });
     } catch (error) {
         console.error('Erreur LLM:', error);
 

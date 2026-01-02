@@ -92,9 +92,14 @@ export default function PdfViewer({ file }: Props) {
         setIsContextModalOpen(false);
 
         try {
+            // Get actual PDF field info from viewer (name, type, alternativeText)
+            const fieldsInfo = viewerRef.current?.getFieldsInfo() || [];
+            console.log('📋 Sending fields info to LLM:', fieldsInfo);
+
             const formData = new FormData();
             formData.append('file', file);
             formData.append('context', context);
+            formData.append('fieldsInfo', JSON.stringify(fieldsInfo));
 
             // Import and call server function
             const { analyzeDocument } = await import('@/server-fns/analyze');
@@ -111,6 +116,7 @@ export default function PdfViewer({ file }: Props) {
                 }
             });
 
+            console.log('🎯 Filling fields:', values);
             fillFormFields(values);
 
         } catch (err) {

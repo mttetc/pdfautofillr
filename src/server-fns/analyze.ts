@@ -1,6 +1,6 @@
 import { createServerFn } from '@tanstack/react-start';
 import { extractTextFromPdf } from '@/lib/pdf';
-import { detectDocumentContext, analyzeFormWithLLM } from '@/lib/llm';
+import { detectDocumentContext, analyzeFormWithLLM, type PdfFieldInfo } from '@/lib/llm';
 
 export const analyzeDocument = createServerFn({ method: 'POST' })
     .inputValidator((data) => {
@@ -9,16 +9,21 @@ export const analyzeDocument = createServerFn({ method: 'POST' })
         }
         const file = data.get('file') as File | null;
         const context = data.get('context')?.toString() || '';
+        const fieldsInfoRaw = data.get('fieldsInfo')?.toString() || '';
 
         if (!file) {
             throw new Error('Aucun fichier fourni');
         }
 
-        return { file, context };
+        return {
+            file,
+            context,
+            fieldsInfo: fieldsInfoRaw ? JSON.parse(fieldsInfoRaw) as PdfFieldInfo[] : []
+        };
     })
     .handler(async ({ data }) => {
         try {
-            const { file, context: userContext } = data;
+            const { file, context: userContext, fieldsInfo } = data;
 
             // Extract text from PDF
             const buffer = await file.arrayBuffer();
@@ -35,8 +40,10 @@ export const analyzeDocument = createServerFn({ method: 'POST' })
                 context = detected || '';
             }
 
-            // Analyze form with LLM
-            const fields = await analyzeFormWithLLM(pdfText, context);
+            // Analyze form with LLM, passing PDF field info
+            const fields = await analyzeFormWithLLM(pdfText, context, fieldsInfo);
+
+            console.log('🎯 Fields to fill:', fields.filter(f => f.suggestedValue).map(f => `${f.name}: ${f.suggestedValue}`));
 
             return {
                 success: true,
