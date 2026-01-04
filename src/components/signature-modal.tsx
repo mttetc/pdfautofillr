@@ -25,9 +25,25 @@ export function SignatureModal({ isOpen, onClose, onConfirm }: Props) {
         if (isOpen && canvasRef.current) {
             const canvas = canvasRef.current;
             const ctx = canvas.getContext('2d', { alpha: true });
+
+            // High resolution canvas for retina/high-DPI screens
+            const dpr = window.devicePixelRatio || 1;
+            const displayWidth = 500;
+            const displayHeight = 220;
+
+            // Set actual canvas size in memory (scaled up)
+            canvas.width = displayWidth * dpr;
+            canvas.height = displayHeight * dpr;
+
+            // Scale canvas CSS to fit display size
+            canvas.style.width = `${displayWidth}px`;
+            canvas.style.height = `${displayHeight}px`;
+
             if (ctx) {
+                // Scale context to match device pixel ratio
+                ctx.scale(dpr, dpr);
                 // Clear with transparent background
-                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                ctx.clearRect(0, 0, displayWidth, displayHeight);
                 // Anti-aliasing settings
                 ctx.imageSmoothingEnabled = true;
                 ctx.imageSmoothingQuality = 'high';
@@ -163,10 +179,8 @@ export function SignatureModal({ isOpen, onClose, onConfirm }: Props) {
                             >
                                 <canvas
                                     ref={canvasRef}
-                                    width={450}
-                                    height={200}
                                     className="cursor-crosshair touch-none"
-                                    style={{ background: 'transparent' }}
+                                    style={{ background: 'transparent', width: '500px', height: '220px' }}
                                     onMouseDown={handleMouseDown}
                                     onMouseMove={handleMouseMove}
                                     onMouseUp={stopDrawing}

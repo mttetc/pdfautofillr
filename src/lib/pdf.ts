@@ -2,7 +2,7 @@
  * PDF utilities for text extraction and form manipulation
  */
 import { extractText, getDocumentProxy } from 'unpdf';
-import { PDFDocument } from 'pdf-lib';
+import { PDFDocument, PDFName } from 'pdf-lib';
 
 // ============================================
 // Types
@@ -63,22 +63,51 @@ export async function exportFilledPdf(
 
             const fieldType = field.constructor.name;
 
-            if (fieldType === 'PDFTextField') {
-                const textField = form.getTextField(fieldName);
-                textField.setText(value);
-            } else if (fieldType === 'PDFCheckBox') {
+            // Use includes() because pdf-lib may return PDFTextField2, PDFCheckBox2, etc.
+            if (fieldType.includes('PDFTextField')) {
+                form.getTextField(fieldName).setText(value);
+            } else if (fieldType.includes('PDFCheckBox')) {
                 const checkBox = form.getCheckBox(fieldName);
+
                 if (value === 'true' || value === 'on') {
                     checkBox.check();
-                } else {
+                } else if (value === 'false' || value === 'off') {
                     checkBox.uncheck();
+                } else {
+                    // Value is an export value (e.g., 'a', 'b', 'c') for multi-widget checkboxes
+                    const acroField = (checkBox as unknown as {
+                        acroField: {
+                            dict: { set: (key: unknown, val: unknown) => void };
+                            getWidgets: () => Array<{
+                                dict: { set: (key: unknown, val: unknown) => void };
+                                getOnValue: () => { toString: () => string } | undefined;
+                            }>;
+                        }
+                    }).acroField;
+
+                    if (acroField?.getWidgets && acroField?.dict) {
+                        const widgets = acroField.getWidgets();
+
+                        // Set the field value
+                        acroField.dict.set(PDFName.of('V'), PDFName.of(value));
+
+                        // Update each widget's appearance state
+                        for (const widget of widgets) {
+                            const onValue = widget.getOnValue?.()?.toString?.();
+                            if (onValue === `/${value}` || onValue === value) {
+                                widget.dict.set(PDFName.of('AS'), PDFName.of(value));
+                            } else {
+                                widget.dict.set(PDFName.of('AS'), PDFName.of('Off'));
+                            }
+                        }
+                    } else {
+                        checkBox.check();
+                    }
                 }
-            } else if (fieldType === 'PDFDropdown') {
-                const dropdown = form.getDropdown(fieldName);
-                dropdown.select(value);
-            } else if (fieldType === 'PDFRadioGroup') {
-                const radioGroup = form.getRadioGroup(fieldName);
-                radioGroup.select(value);
+            } else if (fieldType.includes('PDFDropdown')) {
+                form.getDropdown(fieldName).select(value);
+            } else if (fieldType.includes('PDFRadioGroup')) {
+                form.getRadioGroup(fieldName).select(value);
             }
         } catch (err) {
             console.warn(`Could not set field "${fieldName}":`, err);

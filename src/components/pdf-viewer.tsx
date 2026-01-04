@@ -57,7 +57,7 @@ export default function PdfViewer({ file }: Props) {
                 };
             }
 
-            const filledPdfBytes = await exportFilledPdf(originalBytes, formValues, signatureData);
+            const filledPdfBytes = await exportFilledPdf(originalBytes, formValues, signatureData, true);
 
             const baseName = file.name.replace(/\.pdf$/i, '');
             const exportName = `${baseName}_rempli.pdf`;
@@ -131,24 +131,8 @@ export default function PdfViewer({ file }: Props) {
     }, [file]);
 
     const fillFormFields = (values: Record<string, string>) => {
-        Object.entries(values).forEach(([name, value]) => {
-            const elements = document.querySelectorAll(`[name="${name}"]`);
-            elements.forEach(el => {
-                if (el instanceof HTMLInputElement) {
-                    if (el.type === 'checkbox') {
-                        el.checked = value === 'true' || value === 'on';
-                    } else {
-                        el.value = value;
-                    }
-                    el.dispatchEvent(new Event('input', { bubbles: true }));
-                    el.dispatchEvent(new Event('change', { bubbles: true }));
-                } else if (el instanceof HTMLSelectElement || el instanceof HTMLTextAreaElement) {
-                    el.value = value;
-                    el.dispatchEvent(new Event('input', { bubbles: true }));
-                    el.dispatchEvent(new Event('change', { bubbles: true }));
-                }
-            });
-        });
+        // Use the viewer's setFormValues method which updates both internal ref and DOM
+        viewerRef.current?.setFormValues(values);
     };
 
     const loadingSpinner = (

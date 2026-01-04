@@ -16,3 +16,15 @@ body {
 code {
   font-family: var(--font-mono);
 }
+
+/* Fix react-pdf checkbox border overflow issues */
+.react-pdf__Page__annotations input[type="checkbox"] {
+  box-sizing: border-box !important;
+  border: none !important;
+  outline: none !important;
+}
+
+.react-pdf__Page__annotations .buttonWidgetAnnotation.checkBox input {
+  border: none !important;
+  box-shadow: none !important;
+}

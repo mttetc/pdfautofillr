@@ -2,22 +2,23 @@
 
 import { useState, useEffect, useRef, useImperativeHandle, forwardRef, useCallback } from 'react';
 import { useResizeObserver } from '@wojtekmaj/react-hooks';
-import { Document, Page, pdfjs } from 'react-pdf';
+import { Document, Page } from 'react-pdf';
 import { Spinner } from '@heroui/react';
-import { SignatureOverlay, type SignatureOverlayRef } from './signature-overlay';
-import { PageThumbnails } from './page-thumbnails';
 
-// Import required CSS for annotation layer (forms) and text layer
 import 'react-pdf/dist/Page/AnnotationLayer.css';
 import 'react-pdf/dist/Page/TextLayer.css';
 
-// Configure worker using import.meta.url as per react-pdf documentation
+import { SignatureOverlay, type SignatureOverlayRef } from './signature-overlay';
+import { PageThumbnails } from './page-thumbnails';
+import { extractPdfFields, type PdfFieldInfo } from '@/lib/pdf-fields';
+
+// Worker configuration
+import { pdfjs } from 'react-pdf';
 pdfjs.GlobalWorkerOptions.workerSrc = new URL(
     'pdfjs-dist/build/pdf.worker.min.mjs',
     import.meta.url,
 ).toString();
 
-// Options for Document component (fonts, cMaps, wasm)
 const options = {
     cMapUrl: '/cmaps/',
     standardFontDataUrl: '/standard_fonts/',
@@ -26,14 +27,12 @@ const options = {
 const resizeObserverOptions = {};
 const maxWidth = 800;
 
-export interface PdfFieldInfo {
-    name: string;
-    type: string;
-    alternativeText?: string;
-}
+// Re-export for backward compatibility
+export type { PdfFieldInfo };
 
 export interface PdfViewerRef {
     getFormValues: () => Record<string, string>;
+    setFormValues: (values: Record<string, string>) => void;
     getFieldNames: () => string[];
     getFieldsInfo: () => PdfFieldInfo[];
     getSelectedPageDimensions: () => { width: number; height: number } | null;
@@ -58,25 +57,34 @@ const PdfViewerInner = forwardRef<PdfViewerRef, Props>(({
 }, ref) => {
     const [numPages, setNumPages] = useState(0);
     const [selectedPage, setSelectedPage] = useState(0);
+    const [signaturePage, setSignaturePage] = useState<number | null>(null);
     const [fieldsInfo, setFieldsInfo] = useState<PdfFieldInfo[]>([]);
     const [containerRef, setContainerRef] = useState<HTMLElement | null>(null);
     const [containerWidth, setContainerWidth] = useState<number>();
     const formValuesRef = useRef<Record<string, string>>({});
     const pageRefs = useRef<Map<number, HTMLDivElement>>(new Map());
     const internalSignatureRef = useRef<SignatureOverlayRef>(null);
+    const isScrollingRef = useRef(false);
 
+    // Resize observer
     const onResize = useCallback<ResizeObserverCallback>((entries) => {
         const [entry] = entries;
-        if (entry) {
-            setContainerWidth(entry.contentRect.width);
-        }
+        if (entry) setContainerWidth(entry.contentRect.width);
     }, []);
-
     useResizeObserver(containerRef, resizeObserverOptions, onResize);
 
     const actualSignatureRef = signatureRef || internalSignatureRef;
 
-    // Set page ref for a specific page index
+    // Track signature page when signature is added
+    useEffect(() => {
+        if (signatureDataUrl && signaturePage === null) {
+            setSignaturePage(selectedPage);
+        } else if (!signatureDataUrl) {
+            setSignaturePage(null);
+        }
+    }, [signatureDataUrl, signaturePage, selectedPage]);
+
+    // Set page ref
     const setPageRef = useCallback((index: number, element: HTMLDivElement | null) => {
         if (element) {
             pageRefs.current.set(index, element);
@@ -85,114 +93,42 @@ const PdfViewerInner = forwardRef<PdfViewerRef, Props>(({
         }
     }, []);
 
+    // Expose methods via ref
     useImperativeHandle(ref, () => ({
         getFormValues: () => ({ ...formValuesRef.current }),
+        setFormValues: (values: Record<string, string>) => {
+            Object.assign(formValuesRef.current, values);
+            Object.entries(values).forEach(([name, value]) => {
+                const elements = document.querySelectorAll(`[name="${name}"]`);
+                elements.forEach(el => {
+                    if (el instanceof HTMLInputElement) {
+                        if (el.type === 'checkbox') {
+                            el.checked = value === 'true' || value === 'on';
+                        } else {
+                            el.value = value;
+                        }
+                    } else if (el instanceof HTMLSelectElement || el instanceof HTMLTextAreaElement) {
+                        el.value = value;
+                    }
+                });
+            });
+        },
         getFieldNames: () => fieldsInfo.map(f => f.name),
         getFieldsInfo: () => [...fieldsInfo],
         getSelectedPageDimensions: () => {
-            const pageElement = pageRefs.current.get(selectedPage);
-            if (pageElement) {
-                const canvas = pageElement.querySelector('canvas');
-                if (canvas) {
-                    return { width: canvas.offsetWidth, height: canvas.offsetHeight };
-                }
-            }
-            return null;
+            const pageElement = pageRefs.current.get(signaturePage ?? selectedPage);
+            const canvas = pageElement?.querySelector('canvas');
+            return canvas ? { width: canvas.offsetWidth, height: canvas.offsetHeight } : null;
         },
-        getSignaturePosition: () => {
-            if (actualSignatureRef.current) {
-                return actualSignatureRef.current.getPosition();
-            }
-            return null;
-        },
-        getSelectedPage: () => selectedPage,
-    }), [fieldsInfo, actualSignatureRef, selectedPage]);
+        getSignaturePosition: () => actualSignatureRef.current?.getPosition() ?? null,
+        getSelectedPage: () => signaturePage ?? selectedPage,
+    }), [fieldsInfo, actualSignatureRef, selectedPage, signaturePage]);
 
+    // Load PDF and extract fields
     const handleLoadSuccess = useCallback(async ({ numPages }: { numPages: number }) => {
         setNumPages(numPages);
-
         try {
-            const arrayBuffer = await file.arrayBuffer();
-            const pdf = await pdfjs.getDocument({ data: arrayBuffer }).promise;
-            const fields: PdfFieldInfo[] = [];
-            const seenNames = new Set<string>();
-
-            for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
-                const page = await pdf.getPage(pageNum);
-                const annotations = await page.getAnnotations();
-
-                console.log('Annotations:', annotations);
-                // Get text content with positions
-                const textContent = await page.getTextContent();
-                const textItems: { text: string; x: number; y: number }[] = [];
-
-                for (const item of textContent.items) {
-                    // TextItem has 'str' and 'transform', TextMarkedContent doesn't
-                    if ('str' in item && 'transform' in item) {
-                        const textItem = item as { str: string; transform: number[] };
-                        if (textItem.str.trim().length > 0) {
-                            textItems.push({
-                                text: textItem.str.trim(),
-                                x: textItem.transform[4],
-                                y: textItem.transform[5],
-                            });
-                        }
-                    }
-                }
-
-                for (const annotation of annotations) {
-                    if (annotation.subtype === 'Widget' && annotation.fieldName) {
-                        // Skip duplicates
-                        if (seenNames.has(annotation.fieldName)) continue;
-                        seenNames.add(annotation.fieldName);
-
-                        // Get field position from rect [x1, y1, x2, y2]
-                        const rect = annotation.rect;
-                        const fieldX = rect[0];
-                        const fieldY = rect[1];
-
-                        // Find nearest MEANINGFUL text label (filter out dots and short text)
-                        let nearestLabel = '';
-                        let minDistance = Infinity;
-
-                        for (const textItem of textItems) {
-                            // Skip dotted lines, colons, and very short text
-                            const text = textItem.text;
-                            if (/^[.\s:]+$/.test(text)) continue; // Only dots, spaces, colons
-                            if (/^\.{3,}/.test(text)) continue; // Starts with multiple dots
-                            if (text.length < 3) continue; // Too short
-                            if (['jour', 'mois', 'année', 'an'].includes(text.toLowerCase())) continue; // Date labels
-
-                            // Text should be to the left or above the field
-                            const dx = fieldX - textItem.x;
-                            const dy = fieldY - textItem.y;
-
-                            // Only consider text that is to the left (dx > 0) or above (dy < 50 and dy > -20)
-                            if (dx > -10 && dx < 400 && dy > -30 && dy < 50) {
-                                const distance = Math.sqrt(dx * dx + dy * dy);
-                                if (distance < minDistance) {
-                                    minDistance = distance;
-                                    nearestLabel = text;
-                                }
-                            }
-                        }
-
-                        // Determine field type
-                        let fieldType = 'text';
-                        if (annotation.checkBox) fieldType = 'checkbox';
-                        else if (annotation.radioButton) fieldType = 'radio';
-                        else if (annotation.comboBox) fieldType = 'select';
-
-                        fields.push({
-                            name: annotation.fieldName,
-                            type: fieldType,
-                            alternativeText: nearestLabel || annotation.alternativeText || undefined,
-                        });
-                    }
-                }
-            }
-
-            console.log('📋 Extracted PDF fields with labels:', fields);
+            const fields = await extractPdfFields(file);
             setFieldsInfo(fields);
             onFieldsDetected?.(fields.length);
         } catch (err) {
@@ -200,43 +136,46 @@ const PdfViewerInner = forwardRef<PdfViewerRef, Props>(({
         }
     }, [file, onFieldsDetected]);
 
+    // Form input capture
     useEffect(() => {
-        const container = containerRef;
-        if (!container) return;
+        if (!containerRef) return;
 
         const handleInput = (event: Event) => {
             const target = event.target as HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement;
             if (!target || !target.name) return;
 
             if (target instanceof HTMLInputElement && target.type === 'checkbox') {
-                formValuesRef.current[target.name] = target.checked ? 'true' : 'false';
+                // Get the PDF export value from the exportvalue attribute (set by react-pdf)
+                const exportValue = target.getAttribute('exportvalue') || 'true';
+                if (target.checked) {
+                    formValuesRef.current[target.name] = exportValue;
+                } else {
+                    if (formValuesRef.current[target.name] === exportValue) {
+                        delete formValuesRef.current[target.name];
+                    }
+                }
             } else {
                 formValuesRef.current[target.name] = target.value;
             }
         };
 
-        container.addEventListener('input', handleInput, true);
-        container.addEventListener('change', handleInput, true);
+        containerRef.addEventListener('input', handleInput, true);
+        containerRef.addEventListener('change', handleInput, true);
 
         return () => {
-            container.removeEventListener('input', handleInput, true);
-            container.removeEventListener('change', handleInput, true);
+            containerRef.removeEventListener('input', handleInput, true);
+            containerRef.removeEventListener('change', handleInput, true);
         };
-    }, [containerRef, numPages]);
+    }, [containerRef]);
 
-    // Track if we're programmatically scrolling (to avoid observer conflicts)
-    const isScrollingRef = useRef(false);
-
-    // IntersectionObserver to detect visible page during scroll
+    // Scroll tracking with IntersectionObserver
     useEffect(() => {
         if (!containerRef || numPages === 0) return;
 
         const observer = new IntersectionObserver(
             (entries) => {
-                // Skip if we're doing a programmatic scroll
                 if (isScrollingRef.current) return;
 
-                // Find the most visible page
                 let maxRatio = 0;
                 let mostVisiblePage = selectedPage;
 
@@ -258,7 +197,6 @@ const PdfViewerInner = forwardRef<PdfViewerRef, Props>(({
             }
         );
 
-        // Observe all page elements
         pageRefs.current.forEach((element) => {
             observer.observe(element);
         });
@@ -269,13 +207,10 @@ const PdfViewerInner = forwardRef<PdfViewerRef, Props>(({
     // Handle page selection from thumbnails
     const handleSelectPage = useCallback((pageIndex: number) => {
         setSelectedPage(pageIndex);
-        // Mark that we're doing a programmatic scroll
         isScrollingRef.current = true;
-        // Scroll to the selected page
         const pageElement = pageRefs.current.get(pageIndex);
         if (pageElement) {
             pageElement.scrollIntoView({ behavior: 'smooth', block: 'start' });
-            // Reset the flag after scroll completes
             setTimeout(() => {
                 isScrollingRef.current = false;
             }, 500);
@@ -286,7 +221,7 @@ const PdfViewerInner = forwardRef<PdfViewerRef, Props>(({
 
     return (
         <div className="flex h-full w-full gap-3">
-            {/* Thumbnails sidebar (LEFT) */}
+            {/* Thumbnails sidebar */}
             {numPages > 0 && (
                 <div className="flex-shrink-0 w-[100px] h-full overflow-y-auto">
                     <Document file={file} options={options}>
@@ -300,7 +235,7 @@ const PdfViewerInner = forwardRef<PdfViewerRef, Props>(({
                 </div>
             )}
 
-            {/* Main PDF viewer (RIGHT) */}
+            {/* Main PDF viewer */}
             <div ref={setContainerRef} className="flex-1 h-full min-w-0 overflow-auto">
                 <Document
                     file={file}
@@ -325,13 +260,13 @@ const PdfViewerInner = forwardRef<PdfViewerRef, Props>(({
                                 renderTextLayer
                                 onClick={() => setSelectedPage(index)}
                             >
-                                {/* Signature overlay only on selected page */}
-                                {index === selectedPage && signatureDataUrl && (
+                                {/* Signature stays on the page where it was placed */}
+                                {index === signaturePage && signatureDataUrl && (
                                     <SignatureOverlay
                                         ref={actualSignatureRef as React.RefObject<SignatureOverlayRef>}
                                         imageUrl={signatureDataUrl}
                                         onRemove={onRemoveSignature || (() => { })}
-                                        containerRef={{ current: pageRefs.current.get(selectedPage) || null }}
+                                        containerRef={{ current: pageRefs.current.get(signaturePage) || null }}
                                     />
                                 )}
                             </Page>
